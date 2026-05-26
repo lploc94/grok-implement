@@ -1168,6 +1168,7 @@ function cmdStart(argv) {
     round: 1, timeout, started_at: now,
     last_line_count: 0, stall_count: 0, last_poll_at: 0,
     stall_threshold: stallThreshold, stall_recovery_count: 0,
+    cancel_requested_round: 0, last_poll_responded_at: 0,
   });
 
   writeRounds(resolvedSessionDir, [{
@@ -1319,7 +1320,7 @@ function cmdResume(argv) {
   updateState(resolvedSessionDir, {
     round: newRound, timeout, started_at: now,
     last_line_count: lineCount, stall_count: 0, last_poll_at: 0,
-    last_output_at: now,
+    last_output_at: now, cancel_requested_round: 0, last_poll_responded_at: 0,
   });
 
   rounds.push({
@@ -1341,15 +1342,31 @@ function cmdResume(argv) {
 }
 
 
-function cmdPoll(argv) {
-  const stateDirArg = argv[0];
+async function cmdPoll(argv) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: {
+      "min-interval": { type: "string", default: "120" },
+    },
+    allowPositionals: true,
+    strict: false,
+  });
+
+  const rawMinInterval = values["min-interval"];
+  const parsedInterval = Number.parseInt(rawMinInterval, 10);
+  if (!Number.isFinite(parsedInterval) || parsedInterval < 0) {
+    jsonError("Invalid --min-interval; expected non-negative integer seconds", "INVALID_INPUT");
+    return EXIT_ERROR;
+  }
+  const minInterval = parsedInterval;
+  const stateDirArg = positionals[0];
   if (!stateDirArg) { jsonError("State directory argument required", "INVALID_INPUT"); return EXIT_ERROR; }
 
   let stateDir;
   try { stateDir = fs.realpathSync(stateDirArg); }
   catch { jsonError("Invalid state directory", "INVALID_INPUT"); return EXIT_ERROR; }
 
-  // Check cached final result
+  // Check cached final result — always return immediately
   const finalFile = path.join(stateDir, "final.txt");
   if (fs.existsSync(finalFile)) {
     const cached = fs.readFileSync(finalFile, "utf8");
@@ -1359,12 +1376,50 @@ function cmdPoll(argv) {
   }
 
   const state = readState(stateDir);
-  const brokerPid = state.broker_pid || 0;
-  const timeoutVal = state.timeout || 3600;
-  const startedAt = state.started_at || Math.floor(Date.now() / 1000);
-  const lastLineCount = state.last_line_count || 0;
-  const stallCount = state.stall_count || 0;
-  const stallThreshold = state.stall_threshold || 12;
+  const lastPollRespondedAt = state.last_poll_responded_at || 0;
+  const sinceLastPoll = Math.floor(Date.now() / 1000) - lastPollRespondedAt;
+
+  // Long-poll: if min-interval not elapsed, wait for new output or interval expiry
+  if (minInterval > 0 && lastPollRespondedAt > 0 && sinceLastPoll < minInterval) {
+    const outputFile = path.join(stateDir, "output.jsonl");
+    const baseLineCount = state.last_line_count || 0;
+    const deadline = lastPollRespondedAt + minInterval;
+
+    while (Math.floor(Date.now() / 1000) < deadline) {
+      // Check for terminal result (broker finished)
+      if (fs.existsSync(finalFile)) break;
+
+      // Check for new output lines
+      let currentLines = 0;
+      if (fs.existsSync(outputFile)) {
+        currentLines = fs.readFileSync(outputFile, "utf8").split("\n").filter(l => l.trim()).length;
+      }
+      if (currentLines > baseLineCount) break;
+
+      // Check broker died
+      const brokerPid = readState(stateDir).broker_pid || 0;
+      if (brokerPid && !isAlive(brokerPid)) break;
+
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+
+  // Re-read state after potential wait
+  const freshState = readState(stateDir);
+  const brokerPid = freshState.broker_pid || 0;
+  const timeoutVal = freshState.timeout || 3600;
+  const startedAt = freshState.started_at || Math.floor(Date.now() / 1000);
+  const lastLineCount = freshState.last_line_count || 0;
+  const stallCount = freshState.stall_count || 0;
+  const stallThreshold = freshState.stall_threshold || 12;
+
+  // Re-check final.txt (may have appeared during wait)
+  if (fs.existsSync(finalFile)) {
+    const cached = fs.readFileSync(finalFile, "utf8");
+    process.stdout.write(cached);
+    if (!cached.endsWith("\n")) process.stdout.write("\n");
+    return EXIT_SUCCESS;
+  }
 
   const now = Math.floor(Date.now() / 1000);
   const elapsed = now - startedAt;
@@ -1377,20 +1432,20 @@ function cmdPoll(argv) {
   }
 
   const newStallCount = currentLineCount === lastLineCount ? stallCount + 1 : 0;
-  const lastOutputAt = currentLineCount === lastLineCount ? (state.last_output_at || startedAt) : now;
+  const lastOutputAt = currentLineCount === lastLineCount ? (freshState.last_output_at || startedAt) : now;
 
-  let result = parseOutput(stateDir, lastLineCount, elapsed, brokerAlive, timeoutVal, state);
+  let result = parseOutput(stateDir, lastLineCount, elapsed, brokerAlive, timeoutVal, freshState);
 
   if (!result.terminal) {
     if (elapsed >= timeoutVal) {
       result = {
-        json: { status: "timeout", round: state.round || 1, elapsed_seconds: elapsed, exit_code: EXIT_TIMEOUT, error: `Timeout after ${timeoutVal}s`, output: result.agentText || null, activities: result.json.activities },
+        json: { status: "timeout", round: freshState.round || 1, elapsed_seconds: elapsed, exit_code: EXIT_TIMEOUT, error: `Timeout after ${timeoutVal}s`, output: result.agentText || null, activities: result.json.activities },
         acpSessionId: result.acpSessionId, agentText: result.agentText, terminal: true,
       };
     } else if (newStallCount >= stallThreshold && brokerAlive) {
       result = {
         json: {
-          status: "stalled", round: state.round || 1, elapsed_seconds: elapsed,
+          status: "stalled", round: freshState.round || 1, elapsed_seconds: elapsed,
           exit_code: EXIT_STALLED, error: `No new output for ~${Math.round((now - lastOutputAt) / 60)} minutes`,
           output: result.agentText || null, recoverable: true,
           activities: result.json.activities,
@@ -1402,7 +1457,11 @@ function cmdPoll(argv) {
 
   // REQ-5: when poll declares terminal (timeout/stalled), instruct broker to cancel in-flight prompt
   if (result.terminal && (result.json.status === "timeout" || result.json.status === "stalled")) {
-    try { appendCommand(stateDir, { action: "cancel", round: state.round || 1 }); } catch {}
+    const currentRound = freshState.round || 1;
+    if (!freshState.cancel_requested_round || freshState.cancel_requested_round < currentRound) {
+      updateState(stateDir, { cancel_requested_round: currentRound });
+      try { appendCommand(stateDir, { action: "cancel", round: currentRound }); } catch {}
+    }
   }
 
   if (result.terminal) {
@@ -1418,10 +1477,9 @@ function cmdPoll(argv) {
       }
     }
     atomicWrite(finalFile, JSON.stringify(result.json));
-    // Note: do NOT kill broker here. Broker stays alive for resume.
   }
 
-  if (result.acpSessionId && result.acpSessionId !== state.acp_session_id) {
+  if (result.acpSessionId && result.acpSessionId !== freshState.acp_session_id) {
     updateState(stateDir, { acp_session_id: result.acpSessionId });
   }
 
@@ -1430,6 +1488,7 @@ function cmdPoll(argv) {
     stall_count: newStallCount,
     last_output_at: lastOutputAt,
     last_poll_at: now,
+    last_poll_responded_at: now,
   });
 
   jsonOut(result.json);
@@ -1953,7 +2012,7 @@ if (isMain) {
       case "list": exitCode = cmdList(subArgs); break;
       case "start": exitCode = cmdStart(subArgs); break;
       case "resume": exitCode = cmdResume(subArgs); break;
-      case "poll": exitCode = cmdPoll(subArgs); break;
+      case "poll": exitCode = await cmdPoll(subArgs); break;
       case "stop": exitCode = cmdStop(subArgs); break;
       case "finalize": exitCode = cmdFinalize(subArgs); break;
       case "render": exitCode = cmdRender(subArgs); break;

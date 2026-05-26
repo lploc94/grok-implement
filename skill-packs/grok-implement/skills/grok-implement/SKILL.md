@@ -100,8 +100,10 @@ Validate: returns `{"status":"started","round":1,...}`. Errors:
 
 ### 4. Poll
 ```bash
-POLL_JSON=$(node "$RUNNER" poll "$SESSION_DIR")
+POLL_JSON=$(node "$RUNNER" poll "$SESSION_DIR" --min-interval 120)
 ```
+The runner long-polls: blocks up to `--min-interval` seconds (default 120) until new output appears or the round completes. No need for external sleep/retry loops — just call poll in a loop.
+
 Wait for `status === "completed"`. Report `activities` (thinking, tool calls) to user during the wait. Save Grok's output:
 ```bash
 echo "$POLL_JSON" | node -e '...' > "$SESSION_DIR/outputs/round-001.md"
