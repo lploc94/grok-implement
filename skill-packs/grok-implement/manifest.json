@@ -1,0 +1,6 @@
+{
+  "name": "grok-implement",
+  "version": "1.0.0",
+  "runner": "scripts/grok-runner.js",
+  "skills": ["grok-implement"]
+}
