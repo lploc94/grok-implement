@@ -109,6 +109,9 @@ function install() {
       encoding: 'utf8',
       timeout: 10_000,
     }).trim();
+    if (!versionOutput) {
+      throw new Error('Runner version check returned empty output (possible symlink or gate issue)');
+    }
     console.log(`  grok-runner.js version: ${versionOutput}`);
 
     // Warn if grok CLI not found
@@ -136,8 +139,18 @@ function install() {
     } catch (err) {
       // Rollback
       if (backupPath && fs.existsSync(backupPath)) {
-        try { fs.renameSync(backupPath, skillDir); } catch (e) {
-          console.error(`  Rollback failed: ${e.message}`);
+        try {
+          fs.renameSync(backupPath, skillDir);
+        } catch (rollbackErr) {
+          // REQ-2: composite error with both failures + manual recovery hint
+          const composite = new Error(
+            `Install failed: ${err.message}\n` +
+            `Rollback also failed: ${rollbackErr.message}\n` +
+            `Manual recovery: mv ${backupPath} ${skillDir}`
+          );
+          composite.cause = err;
+          composite.rollbackError = rollbackErr;
+          throw composite;
         }
       }
       throw err;

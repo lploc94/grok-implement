@@ -13,5 +13,8 @@
   "files": [
     "bin/",
     "skill-packs/"
-  ]
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  }
 }

@@ -42,6 +42,7 @@ json_esc() { printf '%s' "$1" | node -e 'let d="";process.stdin.on("data",c=>d+=
 - **Stop after MAX_ROUNDS=10 or stalemate.** Don't loop forever.
 - **Stdin protocol**: `printf '%s' "$PROMPT" | node "$RUNNER" ...` — never `echo`. JSON via heredoc.
 - **Cleanup is required**: always `finalize` + `stop`, even on failure.
+- `cancel <dir>` requests cooperative abort of a hung round (see protocol.md).
 - For poll intervals, error subtypes, file conventions → `Read references/protocol.md`
 
 ## Workflow
@@ -242,5 +243,6 @@ SKILL_START, SPEC_BUILT, GROK_THINKING, TOOL_INVOKED, FILE_CHANGED, ROUND_COMPLE
 - Spec is immutable after first `start`. Need to change scope? Finalize and start a new session.
 - Don't accept Grok's claim of `[x]` without verifying yourself.
 - Trust Grok on tool execution (it ran the command), but re-run verification commands to confirm state.
+- **Trusted working dir only** — broker auto-approves all tool calls including fs read/write/terminal with no path sandbox. Run only in dirs you trust the spec content for.
 - Broker auto-approves all tool calls — only run in trusted working directories.
 - If Grok output doesn't follow OUTPUT_FORMAT, treat as failed round; in revise round, instruct it to re-emit using the schema.

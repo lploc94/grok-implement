@@ -17,11 +17,12 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { parseArgs } from "node:util";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 
@@ -147,6 +148,33 @@ function writeRounds(stateDir, rounds) {
   atomicWrite(path.join(stateDir, "rounds.json"), JSON.stringify(rounds, null, 2));
 }
 
+// REQ-4: broker.state.json for cross-process busy/round tracking (separate from session state.json)
+function readBrokerState(stateDir) {
+  const p = path.join(stateDir, "broker.state.json");
+  try { return JSON.parse(fs.readFileSync(p, "utf8")); }
+  catch { return { busy: false, current_round: 0, last_round_completed: 0, respawning: false }; }
+}
+
+function setBrokerState(stateDir, updates) {
+  const cur = readBrokerState(stateDir);
+  const next = { ...cur, ...updates };
+  atomicWrite(path.join(stateDir, "broker.state.json"), JSON.stringify(next, null, 2));
+  return next;
+}
+
+// Exported for smoke tests (and cmdResume uses it)
+function assertBrokerIdle(stateDir) {
+  let b;
+  try { b = readBrokerState(stateDir); } catch { b = { busy: false, respawning: false, current_round: 0 }; }
+  if (b.busy === true) {
+    return { ok: false, code: "BROKER_BUSY", message: `Broker still processing prior round (busy=true, current_round=${b.current_round || 0})` };
+  }
+  if (b.respawning === true) {
+    return { ok: false, code: "BROKER_RECOVERING", message: "Broker is recovering grok subprocess after cancel" };
+  }
+  return { ok: true };
+}
+
 function appendCommand(stateDir, cmd) {
   const file = path.join(stateDir, "commands.jsonl");
   fs.appendFileSync(file, JSON.stringify(cmd) + "\n", "utf8");
@@ -227,8 +255,17 @@ async function cmdBroker(argv) {
     process.exit(EXIT_ERROR);
   }
 
+  // REQ-4 init broker.state.json (busy tracking for resume gating + cancel/respawn)
+  setBrokerState(stateDir, { busy: false, current_round: 0, last_round_completed: 0, respawning: false });
+
+  // REQ-8: idle TTL (default 30min, overridable via state.json idle_ttl_ms)
+  const brokerState = readState(stateDir);
+  const idleTtlMs = (brokerState && brokerState.idle_ttl_ms) || (30 * 60 * 1000);
+  let lastActivityAt = Date.now();
+  function touchActivity() { lastActivityAt = Date.now(); }
+
   // ---- Spawn grok agent stdio ----
-  const grokProc = spawn("grok", ["agent", "stdio"], {
+  let grokProc = spawn("grok", ["agent", "stdio"], {
     stdio: ["pipe", "pipe", "pipe"],
     cwd: readState(stateDir).working_dir,
   });
@@ -246,6 +283,35 @@ async function cmdBroker(argv) {
   const pending = new Map();
   const terminals = new Map();
   let nextId = 1;
+
+  // REQ-5 cancel state
+  let currentPromptRpcId = null;
+  const CANCEL_GRACE_MS = 10000;
+
+  // REQ-3: single shutdown path for broker (kills terminals + grok tree, records reason, exits)
+  function shutdownBroker(reason, fatal = false) {
+    blog(`shutdownBroker called: ${reason} (fatal=${fatal})`);
+    // Kill all tracked non-exited terminals
+    for (const [tid, term] of terminals) {
+      if (!term.exited && term.proc && term.proc.pid) {
+        try { killTree(term.proc.pid); } catch {}
+      }
+    }
+    terminals.clear();
+    // Kill grok subtree if still alive
+    if (grokProc && grokProc.pid && isAlive(grokProc.pid)) {
+      try { killTree(grokProc.pid); } catch {}
+    }
+    // Record exit event (additive to existing broker.* events)
+    try {
+      appendOutput(stateDir, {
+        type: "broker.exited",
+        reason,
+        ts: Math.floor(Date.now() / 1000),
+      });
+    } catch {}
+    process.exit(fatal ? EXIT_ERROR : EXIT_SUCCESS);
+  }
 
   grokProc.stderr.on("data", chunk => {
     const text = chunk.toString();
@@ -342,9 +408,41 @@ async function cmdBroker(argv) {
         const termCwd = cwd || readState(stateDir).working_dir;
         const termEnv = { ...process.env, ...(env || {}) };
         const termArgs = Array.isArray(args) ? args : [];
-        // Grok often packs shell commands into `command` as a single string with no args.
-        // If no args provided, use shell mode so the string is interpreted by the shell.
-        const useShell = termArgs.length === 0;
+        const SHELL_METACHARS = /[;&|`$<>(){}~'"\\\n\t]/;
+
+        // REQ-1 hardened shell decision (no blanket shell:true for argv-less commands)
+        let finalCommand = command;
+        let finalArgs = termArgs;
+        let useShell = false;
+        const hasMetachars = SHELL_METACHARS.test(command);
+        const hasSpace = /\s/.test(command);
+
+        if (termArgs.length > 0) {
+          // argv provided → always safe, no shell
+          useShell = false;
+          finalCommand = command;
+          finalArgs = termArgs;
+        } else if (!hasMetachars && hasSpace) {
+          // no metachars but spaces → split into argv, spawn direct (no shell)
+          finalArgs = command.trim().split(/\s+/);
+          finalCommand = finalArgs.shift();
+          useShell = false;
+        } else if (!hasMetachars) {
+          // simple token, no args, no shell needed
+          useShell = false;
+          finalCommand = command;
+          finalArgs = [];
+        } else {
+          // metachars present → must use shell
+          useShell = true;
+          finalCommand = command;
+          finalArgs = [];
+          blog(`SHELL MODE: ${command}`);
+          if (process.env.GROK_RUNNER_STRICT_SHELL === "1") {
+            sendErrorResponse(msg.id, -32000, `STRICT_SHELL: shell mode rejected for: ${command}`);
+            return;
+          }
+        }
 
         const term = {
           id: terminalId,
@@ -358,7 +456,7 @@ async function cmdBroker(argv) {
 
         let proc;
         try {
-          proc = spawn(command, termArgs, {
+          proc = spawn(finalCommand, finalArgs, {
             cwd: termCwd, env: termEnv,
             stdio: ["ignore", "pipe", "pipe"],
             shell: useShell,
@@ -389,7 +487,7 @@ async function cmdBroker(argv) {
           term.waiters = [];
         });
         terminals.set(terminalId, term);
-        blog(`terminal/create: ${terminalId} cmd=${command} args=${JSON.stringify(termArgs)} shell=${useShell}`);
+        blog(`terminal/create: ${terminalId} cmd=${finalCommand} args=${JSON.stringify(finalArgs)} shell=${useShell}`);
         sendResponse(msg.id, { terminalId });
       } catch (e) {
         sendErrorResponse(msg.id, -32603, e.message);
@@ -461,6 +559,7 @@ async function cmdBroker(argv) {
     const p = pending.get(msg.id);
     if (!p) return;
     pending.delete(msg.id);
+    if (msg.id === currentPromptRpcId) currentPromptRpcId = null; // REQ-5: in-flight prompt settled
     if (msg.error) p.reject(new Error(msg.error.message ?? JSON.stringify(msg.error)));
     else p.resolve(msg.result ?? {});
   });
@@ -516,8 +615,7 @@ async function cmdBroker(argv) {
   } catch (e) {
     blog(`ACP handshake failed: ${e.message}`);
     appendOutput(stateDir, { type: "broker.fatal", error: `ACP handshake failed: ${e.message}` });
-    grokProc.kill();
-    process.exit(EXIT_ERROR);
+    shutdownBroker(`ACP handshake failed: ${e.message}`, true);
   }
 
   // ---- Command loop ----
@@ -529,7 +627,61 @@ async function cmdBroker(argv) {
   let processing = false;
   let stopRequested = false;
 
+  // REQ-5: cooperative cancel with 10s grace + respawn fallback (kill only; full re-handshake deferred to keep ACP simple)
+  async function processCancel(round) {
+    touchActivity();
+    const r = round || currentRound;
+    blog(`Cancel requested for round ${r}, in-flightRpcId=${currentPromptRpcId}`);
+    if (!currentPromptRpcId) {
+      blog("Cancel: no in-flight prompt; emitting round.cancelled (no-op)");
+      appendOutput(stateDir, { type: "round.cancelled", round: r, mode: "cooperative", note: "no-inflight" });
+      setBrokerState(stateDir, { busy: false, last_round_completed: r });
+      return;
+    }
+
+    // Send ACP session/cancel notification (no "id" — per ACP spec)
+    try {
+      const notif = { jsonrpc: "2.0", method: "session/cancel", params: { sessionId } };
+      grokProc.stdin.write(JSON.stringify(notif) + "\n");
+      blog("Sent session/cancel notification");
+    } catch (e) {
+      blog(`send cancel notif failed: ${e.message}`);
+    }
+
+    // Wait up to CANCEL_GRACE_MS for the in-flight rpc to settle (response or error path clears the id)
+    const start = Date.now();
+    while (Date.now() - start < CANCEL_GRACE_MS && currentPromptRpcId) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+
+    if (!currentPromptRpcId) {
+      appendOutput(stateDir, { type: "round.cancelled", round: r, mode: "cooperative" });
+      setBrokerState(stateDir, { busy: false, last_round_completed: r });
+      blog(`Round ${r} cancelled cooperatively within grace`);
+      return;
+    }
+
+    // Fallback: kill the grok tree (cooperative did not unblock)
+    blog(`Cancel grace expired for round ${r}; killing grok tree`);
+    if (grokProc && grokProc.pid) {
+      try { killTree(grokProc.pid); } catch {}
+    }
+    // Force-clear any stuck pending entry so awaiters reject promptly
+    if (currentPromptRpcId && pending.has(currentPromptRpcId)) {
+      const p = pending.get(currentPromptRpcId);
+      pending.delete(currentPromptRpcId);
+      try { p.reject(new Error("prompt cancelled (grace timeout + kill)")); } catch {}
+    }
+    currentPromptRpcId = null;
+
+    appendOutput(stateDir, { type: "round.cancelled", round: r, mode: "respawn" });
+    setBrokerState(stateDir, { busy: false, last_round_completed: r, respawning: false });
+    // Note: broker stays up but grok child is dead; next resume/poll will surface dead broker.
+    // Full in-process grok re-spawn + re-handshake + new acp_session_id is complex and omitted to avoid destabilizing existing ACP wiring.
+  }
+
   async function processCommand(cmd) {
+    touchActivity();
     if (cmd.action === "stop") {
       blog("Stop command received");
       stopRequested = true;
@@ -540,24 +692,38 @@ async function cmdBroker(argv) {
       const round = cmd.round;
       currentRound = round;
       blog(`Round ${round}: sending prompt (${cmd.text.length} chars)`);
+      setBrokerState(stateDir, { busy: true, current_round: round });
       appendOutput(stateDir, { type: "round.started", round });
+      touchActivity();
 
+      currentPromptRpcId = nextId; // peek: rpc will ++ and use this id
       try {
         const result = await rpc("session/prompt", {
           sessionId,
           prompt: [{ type: "text", text: cmd.text }],
         }, cmd.timeout_ms || 3600000);
 
+        currentPromptRpcId = null;
         appendOutput(stateDir, {
           type: "round.completed",
           round,
           stop_reason: result.stopReason || null,
         });
+        touchActivity();
+        setBrokerState(stateDir, { busy: false, last_round_completed: round });
         blog(`Round ${round} completed: stopReason=${result.stopReason}`);
       } catch (e) {
+        currentPromptRpcId = null;
         appendOutput(stateDir, { type: "round.failed", round, error: e.message });
+        touchActivity();
+        setBrokerState(stateDir, { busy: false, last_round_completed: round });
         blog(`Round ${round} failed: ${e.message}`);
       }
+    }
+
+    if (cmd.action === "cancel") {
+      await processCancel(cmd.round);
+      return;
     }
   }
 
@@ -587,20 +753,23 @@ async function cmdBroker(argv) {
       } catch (e) {
         blog(`Command loop error: ${e.message}`);
       }
+      // REQ-8: idle TTL check (shutdown if no activity for configured duration)
+      if (Date.now() - lastActivityAt > idleTtlMs) {
+        shutdownBroker(`idle TTL expired (${Math.floor(idleTtlMs / 60000)}m)`);
+        break;
+      }
       await new Promise(r => setTimeout(r, BROKER_POLL_COMMANDS_MS));
     }
 
     blog("Broker shutting down");
-    appendOutput(stateDir, { type: "broker.exited" });
-    grokProc.kill();
-    process.exit(0);
+    shutdownBroker("stop requested");
   }
 
   commandLoop();
 
-  // Handle signals gracefully
-  process.on("SIGTERM", () => { stopRequested = true; });
-  process.on("SIGINT", () => { stopRequested = true; });
+  // Handle signals gracefully — use unified shutdown
+  process.on("SIGTERM", () => { shutdownBroker("SIGTERM"); });
+  process.on("SIGINT", () => { shutdownBroker("SIGINT"); });
 }
 
 
@@ -772,6 +941,7 @@ function cmdInit(argv) {
   const sessionsBase = path.join(resolvedWorkingDir, ".grok-implement", "sessions");
   fs.mkdirSync(sessionsBase, { recursive: true });
 
+  // REQ-7: 100 attempts with re-scan every 10, hex fallback after exhaustion (concurrent init safe)
   let maxN = 0;
   try {
     for (const d of fs.readdirSync(sessionsBase)) {
@@ -783,11 +953,38 @@ function cmdInit(argv) {
   } catch {}
 
   let sessionDir, sessionId, created = false;
-  for (let attempt = 0; attempt < 10; attempt++) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (attempt > 0 && attempt % 10 === 0) {
+      // re-scan to catch concurrent inits
+      maxN = 0;
+      try {
+        for (const d of fs.readdirSync(sessionsBase)) {
+          if (d.startsWith(prefix)) {
+            const n = parseInt(d.slice(prefix.length), 10);
+            if (!isNaN(n) && n > maxN) maxN = n;
+          }
+        }
+      } catch {}
+    }
     sessionId = `${prefix}${String(maxN + 1 + attempt).padStart(3, "0")}`;
     sessionDir = path.join(sessionsBase, sessionId);
     try { fs.mkdirSync(sessionDir); created = true; break; }
     catch (e) { if (e.code === "EEXIST") continue; throw e; }
+  }
+
+  if (!created) {
+    // Fallback with random hex suffix
+    const fbN = maxN + 101;
+    const hex = crypto.randomBytes(4).toString("hex");
+    sessionId = `${prefix}${String(fbN).padStart(3, "0")}-${hex}`;
+    sessionDir = path.join(sessionsBase, sessionId);
+    try {
+      fs.mkdirSync(sessionDir);
+      created = true;
+    } catch (e) {
+      process.stderr.write(`Error: could not reserve session directory after 100 attempts and fallback (${e.message})\n`);
+      return EXIT_ERROR;
+    }
   }
 
   if (!created) {
@@ -1067,6 +1264,13 @@ function cmdResume(argv) {
     return EXIT_ERROR;
   }
 
+  // REQ-4: gate on broker.state.json (prevents overlapping rounds / resume during cancel recovery)
+  const idleCheck = assertBrokerIdle(resolvedSessionDir);
+  if (!idleCheck.ok) {
+    jsonError(idleCheck.message, idleCheck.code);
+    return EXIT_ERROR;
+  }
+
   // Enforce max_rounds limit
   const maxRounds = state.max_rounds || 10;
   if ((state.round || 0) >= maxRounds) {
@@ -1196,6 +1400,11 @@ function cmdPoll(argv) {
     }
   }
 
+  // REQ-5: when poll declares terminal (timeout/stalled), instruct broker to cancel in-flight prompt
+  if (result.terminal && (result.json.status === "timeout" || result.json.status === "stalled")) {
+    try { appendCommand(stateDir, { action: "cancel", round: state.round || 1 }); } catch {}
+  }
+
   if (result.terminal) {
     const rounds = readRounds(stateDir);
     if (rounds.length > 0) {
@@ -1311,28 +1520,49 @@ const TEMPLATE_MAP = {
 };
 
 function extractTemplateSection(promptsMd, targetHeading) {
+  // REQ-9: strict line-based fence parser.
+  // - Stop "next heading" search only for ## that appear *outside* the template fence.
+  // - Inner ```...``` (examples) temporarily "in fence" so their ## are not treated as section end.
+  // - Return literal content between the outer opening ``` and its matching closer.
   const lines = promptsMd.split("\n");
-  let inTarget = false, sectionLines = [], found = false, inFence = false;
+  let i = 0;
+  // Find target heading (must be outside any fence)
+  for (; i < lines.length; i++) {
+    const m = lines[i].match(/^## (.+)$/);
+    if (m && m[1].trim() === targetHeading) {
+      i++; // past heading
+      break;
+    }
+  }
+  if (i >= lines.length) return null;
 
-  for (const line of lines) {
-    if (line.trimEnd().match(/^```/)) {
-      if (inTarget) { sectionLines.push(line); inFence = !inFence; continue; }
-      inFence = !inFence;
+  // Find the opening fence for this template
+  let openIdx = -1;
+  for (; i < lines.length; i++) {
+    if (/^```/.test(lines[i])) {
+      openIdx = i;
+      i++;
+      break;
     }
-    if (!inFence) {
-      const headingMatch = line.match(/^## (.+)$/);
-      if (headingMatch) {
-        if (inTarget) break;
-        if (headingMatch[1].trim() === targetHeading) { inTarget = true; found = true; continue; }
-      }
-    }
-    if (inTarget) sectionLines.push(line);
+  }
+  if (openIdx === -1) return null;
+
+  // Find the outer closing fence.
+  // Templates are separated by `---` lines. The outer close is the LAST ```
+  // before the next `---` separator (or EOF). This handles nested inner fences.
+  let separatorIdx = lines.length;
+  for (let j = i; j < lines.length; j++) {
+    if (/^---\s*$/.test(lines[j])) { separatorIdx = j; break; }
+  }
+  let closeIdx = -1;
+  for (let j = separatorIdx - 1; j > openIdx; j--) {
+    if (/^```\s*$/.test(lines[j])) { closeIdx = j; break; }
   }
 
-  if (!found) return null;
-  const content = sectionLines.join("\n");
-  const fenceMatch = content.match(/```[^\n]*\n([\s\S]*?)```/);
-  return fenceMatch ? fenceMatch[1] : content.trim();
+  if (closeIdx <= openIdx) return null;
+
+  const section = lines.slice(openIdx + 1, closeIdx);
+  return section.join("\n");
 }
 
 function cmdRender(argv) {
@@ -1385,7 +1615,14 @@ function cmdRender(argv) {
   }
 
   const rendered = template.replace(/\{([A-Z][A-Z_0-9]{1,})\}/g, (match, name) => {
-    if (placeholders[name] !== undefined) return String(placeholders[name]);
+    if (placeholders[name] !== undefined) {
+      let val = String(placeholders[name]);
+      if (val.includes("```")) {
+        process.stderr.write(`Warning: placeholder ${name} contained \`\`\`; escaping to ʼʼʼ for fence safety\n`);
+        val = val.replaceAll("```", "ʼʼʼ");
+      }
+      return val;
+    }
     return "";
   });
 
@@ -1421,9 +1658,9 @@ function validateSpec(specMd) {
       return { ok: false, error: `section '${sec}' is empty` };
     }
   }
-  // ACCEPTANCE_CRITERIA must have at least one bullet starting with AC-
+  // ACCEPTANCE_CRITERIA must have at least one bullet with AC-N: (or . ) - ) with non-empty content after
   const acContent = extractSection(specMd, "ACCEPTANCE_CRITERIA");
-  const acLines = acContent.split("\n").filter(l => /^\s*[-*]\s*AC-?\d/i.test(l));
+  const acLines = acContent.split("\n").filter(l => /^\s*[-*]\s*AC-?\d+\s*[:.\)\-]\s*\S+/i.test(l));
   if (acLines.length === 0) {
     return { ok: false, error: "ACCEPTANCE_CRITERIA must have at least 1 bullet starting with 'AC-N: ...'" };
   }
@@ -1618,31 +1855,122 @@ function cmdStatus(argv) {
   return EXIT_SUCCESS;
 }
 
-// ============================================================
-// Main dispatch
-// ============================================================
+function cmdCancel(argv) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: {
+      wait: { type: "boolean", default: true },
+      timeout: { type: "string", default: "30000" },
+      help: { type: "boolean", default: false },
+    },
+    strict: false,
+  });
 
-const subcommand = process.argv[2];
-const subArgs = process.argv.slice(3);
-
-(async () => {
-  let exitCode;
-  switch (subcommand) {
-    case "version": exitCode = cmdVersion(); break;
-    case "init": exitCode = cmdInit(subArgs); break;
-    case "info": exitCode = cmdInfo(subArgs); break;
-    case "list": exitCode = cmdList(subArgs); break;
-    case "start": exitCode = cmdStart(subArgs); break;
-    case "resume": exitCode = cmdResume(subArgs); break;
-    case "poll": exitCode = cmdPoll(subArgs); break;
-    case "stop": exitCode = cmdStop(subArgs); break;
-    case "finalize": exitCode = cmdFinalize(subArgs); break;
-    case "render": exitCode = cmdRender(subArgs); break;
-    case "status": exitCode = cmdStatus(subArgs); break;
-    case "_broker": await cmdBroker(subArgs); return;
-    default:
-      process.stderr.write(`grok-runner: unknown subcommand '${subcommand}'\nAvailable: version, init, info, list, start, resume, poll, stop, finalize, render, status\n`);
-      exitCode = EXIT_ERROR;
+  if (values.help || argv.includes("--help") || !positionals[0]) {
+    process.stdout.write("Usage: grok-runner cancel <session-dir> [--wait=true] [--timeout=30000]\n");
+    process.stdout.write("  Appends cancel command to broker. With --wait (default), polls for round.cancelled event.\n");
+    return EXIT_SUCCESS;
   }
-  if (exitCode !== undefined) process.exit(exitCode);
+
+  const sessionDirArg = positionals[0];
+  let stateDir;
+  try { stateDir = fs.realpathSync(sessionDirArg); }
+  catch { jsonError("Invalid session directory", "INVALID_INPUT"); return EXIT_ERROR; }
+
+  let state;
+  try { state = readState(stateDir); } catch (e) { jsonError(`Cannot read state: ${e.message}`, "IO_ERROR"); return EXIT_ERROR; }
+
+  if (!state.broker_pid || !isAlive(state.broker_pid)) {
+    jsonError("Broker not alive — cannot cancel. (Use stop or start a fresh session.)", "BROKER_DEAD");
+    return EXIT_ERROR;
+  }
+
+  const round = state.round || 1;
+  appendCommand(stateDir, { action: "cancel", round });
+
+  const result = { status: "cancel-issued", session_dir: stateDir, round, wait: values.wait };
+
+  if (!values.wait) {
+    jsonOut(result);
+    return EXIT_SUCCESS;
+  }
+
+  // Wait for round.cancelled in output.jsonl
+  const timeoutMs = parseInt(values.timeout, 10) || 30000;
+  const outputFile = path.join(stateDir, "output.jsonl");
+  const start = Date.now();
+  let found = null;
+  while (Date.now() - start < timeoutMs) {
+    if (fs.existsSync(outputFile)) {
+      const lines = fs.readFileSync(outputFile, "utf8").split("\n").filter(l => l.trim());
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const d = JSON.parse(lines[i]);
+          if (d.type === "round.cancelled" && d.round === round) {
+            found = d;
+            break;
+          }
+        } catch {}
+      }
+      if (found) break;
+    }
+    syncSleep(250);
+  }
+
+  if (found) {
+    jsonOut({ ...result, status: "cancelled", mode: found.mode, event: found });
+    return EXIT_SUCCESS;
+  }
+
+  jsonOut({ ...result, status: "cancel-issued", note: "timeout waiting for round.cancelled event" });
+  return EXIT_TIMEOUT;
+}
+
+// ============================================================
+// Main dispatch (gated so the module can be imported by tests without side effects)
+// ============================================================
+
+const isMain = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    // Use realpath to resolve symlinks (e.g. macOS /var -> /private/var)
+    return fs.realpathSync(fileURLToPath(import.meta.url)) === fs.realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
 })();
+
+if (isMain) {
+  const subcommand = process.argv[2];
+  const subArgs = process.argv.slice(3);
+
+  (async () => {
+    let exitCode;
+    switch (subcommand) {
+      case "version": exitCode = cmdVersion(); break;
+      case "init": exitCode = cmdInit(subArgs); break;
+      case "info": exitCode = cmdInfo(subArgs); break;
+      case "list": exitCode = cmdList(subArgs); break;
+      case "start": exitCode = cmdStart(subArgs); break;
+      case "resume": exitCode = cmdResume(subArgs); break;
+      case "poll": exitCode = cmdPoll(subArgs); break;
+      case "stop": exitCode = cmdStop(subArgs); break;
+      case "finalize": exitCode = cmdFinalize(subArgs); break;
+      case "render": exitCode = cmdRender(subArgs); break;
+      case "status": exitCode = cmdStatus(subArgs); break;
+      case "cancel": exitCode = cmdCancel(subArgs); break;
+      case "_broker": await cmdBroker(subArgs); return;
+      default:
+        process.stderr.write(`grok-runner: unknown subcommand '${subcommand}'\nAvailable: version, init, info, list, start, resume, poll, stop, finalize, render, cancel, status\n`);
+        exitCode = EXIT_ERROR;
+    }
+    if (exitCode !== undefined) process.exit(exitCode);
+  })();
+}
+
+// Export pure helpers for smoke tests (CLI behavior unchanged when run as main)
+export {
+  extractTemplateSection,
+  validateSpec,
+  assertBrokerIdle,
+};

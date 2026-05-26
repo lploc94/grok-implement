@@ -118,6 +118,7 @@ Detailed reference for grok-implement's multi-round protocol. Read on-demand for
 | `finalize <dir>` | Write meta.json | — | JSON summary |
 | `render --skill X --template T --skills-dir D` | Substitute placeholders in prompt template | JSON on stdin | rendered text |
 | `status <dir>` | Liveness + round info | — | JSON |
+| `cancel <dir>` | Request cooperative cancel of in-flight round (10s grace + kill fallback; emits round.cancelled) | — | JSON |
 | `_broker <dir>` | (internal) long-running broker | — | logs to broker.log |
 
 ## Stdin Format Rules
@@ -275,3 +276,48 @@ node "$RUNNER" list --working-dir "$PWD"
 ```
 
 Returns array of all sessions with task summary and AC status — useful for resuming/aggregating across parallel sub-tasks.
+
+## Cancel semantics
+
+The `cancel <dir>` subcommand (and auto-cancel on poll timeout/stalled) appends `{action:"cancel", round:N}` to commands.jsonl.
+
+Broker handling:
+- Sends ACP `session/cancel` notification (no `id`) for the current acp_session_id if an in-flight `session/prompt` RPC is tracked (`currentPromptRpcId`).
+- Waits up to `CANCEL_GRACE_MS=10000` (10s) for the in-flight request to settle (response or error clears the tracker).
+- On success within grace: emits `round.cancelled` with `mode:"cooperative"`.
+- On grace expiry: kills the grok tree (fallback), emits `round.cancelled` with `mode:"respawn"`, clears busy.
+- During recovery, `cmdResume` returns `BROKER_RECOVERING`; after hard cancel the broker may appear dead on next poll (client should init fresh session if needed).
+
+Error codes during busy/recovery:
+- `BROKER_BUSY`: another round is being processed (from `broker.state.json`).
+- `BROKER_RECOVERING`: broker is in post-cancel grok respawn window.
+
+## Idle TTL
+
+Broker reads `idle_ttl_ms` from session `state.json` at startup (default: 30 minutes = `1800000`).
+
+`lastActivityAt` is updated on:
+- Every command received (prompt/start/resume/cancel/stop)
+- `round.started`, `round.completed`, `round.failed`, `round.cancelled` events
+
+If `Date.now() - lastActivityAt > idleTtlMs` in the command loop, broker calls `shutdownBroker("idle TTL expired (Nm)")` and exits with `broker.exited` event. Prevents orphan brokers on long-idle sessions.
+
+Override per-session: edit `state.json` before `start` / `resume` and set `"idle_ttl_ms": 300000` (5 min) etc.
+
+## Strict shell mode
+
+In `terminal/create` (inside grok agent stdio), shell mode is no longer the default for argv-less commands.
+
+Decision (in priority):
+1. `args` provided → `shell:false` (argv array passed literally).
+2. No metachars (`[;&|`$<>]`) and command has spaces → split on whitespace → `shell:false`.
+3. No metachars, no spaces → `shell:false` with command as argv[0].
+4. Metachars present → `shell:true`, log `SHELL MODE: <cmd>`.
+
+If `GROK_RUNNER_STRICT_SHELL=1` in broker env and metachars would require shell: broker responds with JSON-RPC error code `-32000`, message `"STRICT_SHELL: shell mode rejected for: <command>"`. No process is spawned. Use to harden against command injection in untrusted specs.
+
+## Render escaping
+
+`cmdRender` escapes any ` ``` ` (triple backtick) inside placeholder values by replacing with `ʼʼʼ` (modifier letter apostrophe ×3, visually distinct but readable). A warning is printed to stderr when escaping occurs. This prevents the rendered prompt from accidentally closing the outer template fence when the value itself contains markdown code blocks (especially relevant for Reconcile Prompt which documents OUTPUT_FORMAT inside its template).
+
+See also `extractTemplateSection` (strict fence parser that does not toggle on inner fences).
