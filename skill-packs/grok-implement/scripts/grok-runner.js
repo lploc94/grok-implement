@@ -1376,27 +1376,23 @@ async function cmdPoll(argv) {
   }
 
   const state = readState(stateDir);
-  const lastPollRespondedAt = state.last_poll_responded_at || 0;
-  const sinceLastPoll = Math.floor(Date.now() / 1000) - lastPollRespondedAt;
+  // Anchor the interval to the last poll response; on the first poll of a round
+  // there is no prior response, so fall back to the round start so the first
+  // poll also respects the interval instead of returning immediately.
+  const anchor = state.last_poll_responded_at || state.started_at || Math.floor(Date.now() / 1000);
+  const sinceAnchor = Math.floor(Date.now() / 1000) - anchor;
 
-  // Long-poll: if min-interval not elapsed, wait for new output or interval expiry
-  if (minInterval > 0 && lastPollRespondedAt > 0 && sinceLastPoll < minInterval) {
-    const outputFile = path.join(stateDir, "output.jsonl");
-    const baseLineCount = state.last_line_count || 0;
-    const deadline = lastPollRespondedAt + minInterval;
+  // Long-poll: block until the interval elapses. Return only when the interval
+  // is up, the session finishes (final.txt), or the broker dies — NOT on every
+  // new output line (Grok streams continuously, which would defeat the wait).
+  if (minInterval > 0 && sinceAnchor < minInterval) {
+    const deadline = anchor + minInterval;
 
     while (Math.floor(Date.now() / 1000) < deadline) {
-      // Check for terminal result (broker finished)
+      // Session finished — return the cached result immediately
       if (fs.existsSync(finalFile)) break;
 
-      // Check for new output lines
-      let currentLines = 0;
-      if (fs.existsSync(outputFile)) {
-        currentLines = fs.readFileSync(outputFile, "utf8").split("\n").filter(l => l.trim()).length;
-      }
-      if (currentLines > baseLineCount) break;
-
-      // Check broker died
+      // Broker died — result will be terminal, no point waiting longer
       const brokerPid = readState(stateDir).broker_pid || 0;
       if (brokerPid && !isAlive(brokerPid)) break;
 

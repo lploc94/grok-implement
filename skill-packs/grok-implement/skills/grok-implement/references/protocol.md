@@ -113,7 +113,7 @@ Detailed reference for grok-implement's multi-round protocol. Read on-demand for
 | `list --working-dir D` | All sessions in workspace | — | JSON array |
 | `start <dir> --timeout T` | Validate spec, spawn broker, send round 1 | prompt on stdin | JSON `{status:"started",round:1,...}` |
 | `resume <dir> --timeout T` | Send next round prompt to existing broker | prompt on stdin | JSON `{status:"started",round:N,...}` |
-| `poll <dir> [--min-interval N]` | Read latest events, return current status. Long-polls up to N seconds (default 120) if no new output since last poll. | — | JSON `{status,round,output,activities,...}` |
+| `poll <dir> [--min-interval N]` | Read latest events, return current status. Long-polls for N seconds (default 120) before returning, unless the round has already completed. | — | JSON `{status,round,output,activities,...}` |
 | `stop <dir>` | Send stop to broker, kill if hung | — | JSON `{status:"stopped"}` |
 | `finalize <dir>` | Write meta.json | — | JSON summary |
 | `render --skill X --template T --skills-dir D` | Substitute placeholders in prompt template | JSON on stdin | rendered text |
@@ -169,16 +169,16 @@ If validation fails: `{"error":"...","code":"SPEC_INCOMPLETE"}`. Edit spec.md an
 
 The `poll` command supports built-in long-polling via `--min-interval N` (seconds, default 120). When set:
 
-- If fewer than N seconds have elapsed since the last poll response, the runner **blocks** (up to N seconds) instead of returning immediately.
-- The runner breaks out early if: (a) new output lines appear in `output.jsonl`, (b) `final.txt` is written (round completed/failed), or (c) the broker process dies.
-- First poll of a session always returns immediately (no prior `last_poll_responded_at`).
+- The runner **blocks** for up to N seconds before returning, so you get at most one response per interval — not one per Grok step. New output lines alone do NOT end the wait.
+- The runner breaks out early only if: (a) `final.txt` is written (round completed/failed), or (b) the broker process dies.
+- The interval is anchored to the last poll response, or to the round start on the first poll — so even the first poll of a round waits the full interval.
 - Terminal results (`final.txt` cached) always return immediately regardless of interval.
 
-This eliminates wasteful rapid polling. Consumer calls `poll --min-interval 120` in a loop — each call blocks up to 2 minutes or until there's something new to report.
+This eliminates wasteful rapid polling. Consumer calls `poll --min-interval 120` in a loop — each call blocks ~2 minutes (or until the round finishes), then reports the latest status.
 
 Example:
 ```bash
-# Consumer loop — one call every ≤120s, returns early on new output
+# Consumer loop — one call every ~120s, returns early only when the round finishes
 while true; do
   POLL_JSON=$(node "$RUNNER" poll "$SESSION_DIR" --min-interval 120)
   STATUS=$(echo "$POLL_JSON" | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).status')
