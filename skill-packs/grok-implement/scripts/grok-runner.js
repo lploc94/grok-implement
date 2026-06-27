@@ -833,9 +833,21 @@ function parseOutput(stateDir, lastLineCount, elapsed, brokerAlive, timeoutVal, 
     }
   }
 
-  // Build activities from new lines for current round
+  // Build activities from new lines for current round.
+  // Grok streams thinking token-by-token (one acp.agent_thought_chunk per
+  // token), so coalesce consecutive thought chunks into a single "thinking"
+  // activity instead of emitting one per word. Tool calls stay per-step.
   const activities = [];
   const newLines = allLines.slice(lastLineCount);
+  let thoughtBuf = "";
+  const flushThought = () => {
+    if (thoughtBuf) {
+      let txt = thoughtBuf;
+      if (txt.length > 150) txt = txt.slice(0, 150) + "...";
+      activities.push({ time: elapsed, type: "thinking", detail: txt });
+      thoughtBuf = "";
+    }
+  };
   for (const line of newLines) {
     let d;
     try { d = JSON.parse(line); } catch { continue; }
@@ -843,17 +855,18 @@ function parseOutput(stateDir, lastLineCount, elapsed, brokerAlive, timeoutVal, 
 
     const t = d.type || "";
     if (t === "acp.agent_thought_chunk" && d.text) {
-      let txt = d.text;
-      if (txt.length > 150) txt = txt.slice(0, 150) + "...";
-      activities.push({ time: elapsed, type: "thinking", detail: txt });
+      thoughtBuf += d.text;
     } else if (t === "acp.tool_call") {
+      flushThought();
       activities.push({ time: elapsed, type: "tool_started", detail: d.title || d.kind || "tool" });
     } else if (t === "acp.tool_call_update") {
       if (d.status_field === "completed") {
+        flushThought();
         activities.push({ time: elapsed, type: "tool_completed", detail: d.title || d.kind || "tool" });
       }
     }
   }
+  flushThought();
 
   const currentRound = targetRound;
 

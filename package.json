@@ -1,6 +1,6 @@
 {
   "name": "grok-implement",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Skill that delegates implementation tasks to Grok Build CLI via ACP, with structured spec, acceptance criteria, and verify→revise loop. Claude orchestrates and verifies.",
   "license": "MIT",
   "type": "module",
